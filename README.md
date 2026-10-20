@@ -143,6 +143,27 @@ echo 'sk-xxxxxxxx' | node lib/cli.mjs key
 
 （AK/SK 是成对的两个键，不走其它厂商 `vendorKeys.<模板 id>` 的单键模式；未配置时火山卡会显示「未配置火山 IAM 凭据（AK/SK）」提示。）
 
+**计费声明按 provider 区分**：火山域名只证明平台，默认保留本地按量估算，不是官方账单。配额查询成功、配置 IAM 凭据或手动选择火山卡都不会把按量调用归零。先在插件根目录运行以下只读命令，复制实际 providerId（不输出密钥）：
+
+```bash
+node lib/cli.mjs providers
+```
+
+在 `config.json` 顶层合并如下字段，将占位 ID 替换为上一步的实际值（大小写须一致）：
+
+```json
+{
+  "volcBillingByProvider": {
+    "实际订阅-providerId": "plan",
+    "实际按量-providerId": "api"
+  }
+}
+```
+
+只有火山来源且精确声明为 `plan` 的 provider 才不累加按量金额；其它 provider 不受影响，未声明或无效值仍保留按量估算。订阅配额查询暂时失败不会改变该分类。代理地址无法识别为火山时不自动推断订阅。本轮不根据未经验证的 URL 路径或 key 前缀猜测计费方式。
+
+声明按当前 provider 配置应用于本机统计；若同一个 providerId 以后改用于不同计费方式，历史统计也会按当前配置重新归类，建议为按量和订阅保留不同 providerId。火山按量模型缺价目时沿用 tokens 兜底，不虚构金额。
+
 本机时间偏差超过 15 分钟会返回 `InvalidTimestamp`（界面提示「时间偏差过大」），校准时钟即可。
 
 ---
@@ -221,3 +242,4 @@ echo 'sk-xxxxxxxx' | node lib/cli.mjs key
 | 给 ZCode 内助手读的使用说明 | [skills/zcode-fox-widget/SKILL.md](./skills/zcode-fox-widget/SKILL.md) |
 | 贡献规范 | [CONTRIBUTING.md](./CONTRIBUTING.md) |
 | 一次性调查 / 交接档案 | [docs/INDEX.md](./docs/INDEX.md) |
+

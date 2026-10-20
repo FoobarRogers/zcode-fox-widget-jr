@@ -445,6 +445,16 @@ try {
   )
   check('刷新后 displayMode 保持 Plan 配额', reloaded === 'plan', 'value=' + JSON.stringify(reloaded))
 
+  // 火山显示模式也必须经过选择、保存和页面重载，而不是仅检查选项存在。
+  await cdp.eval("(function(){var s=Array.from(document.querySelectorAll('select')).find(function(s){return Array.from(s.options).some(function(o){return o.value==='volc'})});s.value='volc';s.dispatchEvent(new Event('change'))})()")
+  await new Promise((r) => setTimeout(r, 1200))
+  const volcSaved = await (await fetch('http://127.0.0.1:' + PORT + '/whale/size.json')).json()
+  check('火山 displayMode 通过菜单持久化', volcSaved.displayMode === 'volc')
+  await cdp.send('Page.reload')
+  await new Promise((r) => setTimeout(r, 3000))
+  const volcReloaded = await cdp.eval("Array.from(document.querySelectorAll('select')).find(function(s){return Array.from(s.options).some(function(o){return o.value==='volc'})}).value")
+  check('页面重载后保持火山显示模式', volcReloaded === 'volc')
+
   // ⑤ 手动切 DeepSeek 源：无 key 时错误文案必须完整换行显示
   // ——回归 slice(0,14) 把「未找到 DeepSeek API Key…」截成「未找到DeepSeek A」的缺陷
   await cdp.eval(
@@ -3105,3 +3115,4 @@ try {
 const failed = results.filter((r) => !r.ok)
 console.log('\n' + (failed.length === 0 ? '前端冒烟全部通过（' + results.length + '/' + results.length + '）' : '失败 ' + failed.length + ' 项'))
 process.exit(failed.length === 0 ? 0 : 1)
+
