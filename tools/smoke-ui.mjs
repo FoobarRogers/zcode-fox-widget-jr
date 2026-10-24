@@ -20,11 +20,13 @@ import { DatabaseSync } from 'node:sqlite'
 
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 
+// Chrome 优先：本机 Edg/155 headless 不再向 stdout/stderr 打印 DevTools 行，
+// 随机调试端口无法解析；Chrome 打印行为保持不变。
 const BROWSERS = [
-  'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
-  'C:/Program Files/Microsoft/Edge/Application/msedge.exe',
   'C:/Program Files/Google/Chrome/Application/chrome.exe',
   'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe',
+  'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
+  'C:/Program Files/Microsoft/Edge/Application/msedge.exe',
 ]
 const browser = BROWSERS.find((p) => {
   try {
