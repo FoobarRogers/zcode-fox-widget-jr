@@ -837,6 +837,103 @@ function check(name, ok, detail) {
     fs.rmSync(emptyHome, { recursive: true, force: true })
   }
 
+  // issue #14 回归：新鲜日志但剩余额度为 0（限时活动套餐用完仍在有效期内，
+  // 客户端继续轮询它——日志「新鲜」却只是废弃套餐的最后一份快照）。取源链要
+  // 补试一次直连接口；接口不可用（这里无凭据，早返回不出网）时保留日志的 0%。
+  {
+    const zeroHome = fs.mkdtempSync(path.join(os.tmpdir(), 'whale-plan-zero-'))
+    const zeroLogDir = path.join(zeroHome, '.zcode', 'v2', 'logs')
+    fs.mkdirSync(zeroLogDir, { recursive: true })
+    const zeroFixture = {
+      balanceCount: 1,
+      balances: [
+        {
+          entitlement_id: 'ent-devday',
+          show_name: 'ZCode 1024 Dev Day',
+          total_units: 500_000_000,
+          used_units: 500_000_000,
+          remaining_units: 0,
+          available_units: 0,
+          reserved_units: null,
+        },
+      ],
+      code: 0,
+      msg: '',
+      payload: {
+        code: 0,
+        msg: '',
+        data: {
+          server_time: Math.floor(Date.now() / 1000),
+          plans: [
+            {
+              plan_id: 'zcode-v3-start-plan-zero',
+              name: 'ZCode 1024 Dev Day',
+              status: 'active',
+              // 仍在有效期：expiresAt 未到，客户端才会继续轮询它
+              starts_at: Math.floor(Date.now() / 1000) - 86400,
+              ends_at: Math.floor(Date.now() / 1000) + 7 * 86400,
+              entitlements: [
+                {
+                  entitlement_id: 'ent-devday',
+                  show_name: 'ZCode 1024 Dev Day',
+                  meter: 'model_usage',
+                  unit_type: 'token',
+                  capabilities: ['model:glm-5.3'],
+                  grant_units: 500_000_000,
+                  period: 'one_time',
+                },
+              ],
+            },
+          ],
+          balances: [],
+        },
+      },
+    }
+    const zeroLine =
+      '[2026-10-24 21:00:00.000Z] [info] [pid:1] [main] [host-log] (local-1) [host] [2026-10-24 21:00:00.000Z] [pid:2] [usage-stats] billing/balance 请求完成 ' +
+      JSON.stringify(zeroFixture) +
+      '\n'
+    fs.writeFileSync(path.join(zeroLogDir, todayKeyForLog() + '.log'), zeroLine)
+    const childEnv = { ...process.env, ZCODE_HOME: zeroHome, ZCODE_DATA_BASE_DIR: zeroHome, FOX_WIDGET_DATA_DIR: zeroHome }
+    delete childEnv.ZHIPU_API_KEY
+    delete childEnv.BIGMODEL_API_KEY
+    delete childEnv.GLM_API_KEY
+    const probe = spawnSync(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        "import { readPlanQuota } from " +
+          JSON.stringify(pathToFileURL(path.join(PLUGIN_ROOT, 'lib', 'plan-balance.mjs')).href) +
+          ";\nconst chain = await readPlanQuota();\nconsole.log(JSON.stringify({ ok: chain.ok, source: chain.source, percentRemaining: chain.percentRemaining, stale: chain.stale }));",
+      ],
+      { encoding: 'utf8', timeout: 20000, env: childEnv }
+    )
+    let zeroOut = null
+    try {
+      zeroOut = JSON.parse(String(probe.stdout || '').trim().split('\n').pop())
+    } catch (err) {}
+    check(
+      'GLM Plan 取源链：新鲜日志 0% 且接口不可用时保留日志 0%（issue #14，不误判成无数据）',
+      !!zeroOut && zeroOut.ok === true && zeroOut.source === 'plan-log' && zeroOut.percentRemaining === 0 && zeroOut.stale === false,
+      JSON.stringify(zeroOut) + ' stderr=' + String(probe.stderr || '').slice(0, 120)
+    )
+    fs.rmSync(zeroHome, { recursive: true, force: true })
+  }
+
+  // issue #14 绊线：取源链必须有「新鲜日志 0% → 补试直连接口」的子分支。
+  // 接口有剩余的翻转半边需要真凭据，端到端在报告者账号上验证过（issue #14），
+  // 这里钉住分支存在防重构悄悄丢掉。
+  {
+    const planSrc = fs.readFileSync(path.join(PLUGIN_ROOT, 'lib', 'plan-balance.mjs'), 'utf8')
+    check(
+      'GLM Plan 取源链：新鲜日志 0% 时补试直连接口的子分支（issue #14 绊线）',
+      planSrc.indexOf('} else if (log.percentRemaining <= 0) {') !== -1 &&
+        planSrc.indexOf('if (api && api.ok && api.percentRemaining > 0) payload = api') !== -1,
+      ''
+    )
+  }
+
   // ZCode 启动就绪判定（浮层门控用）：日志里有 boot 标记但没有 ready 标记 =
   // 加载动画期间，浮层先不显示；缺 boot 标记（老版本/日志缺失）一律放行。
   // v1.5.4：标记要认「本次启动」的 pid——同一天日志里躺着上一次运行完整的
@@ -3783,6 +3880,30 @@ try {
       /function applyInteractive\(next, force\)/.test(mainSrc) &&
         /interactive\) applyInteractive\(false, true\)/.test(mainSrc) &&
         /hideOverlay\('zcode-identity-changed'\)/.test(mainSrc),
+      ''
+    )
+    check(
+      'issue#13：页面心跳带功能探针，命中未接管连续两拍重建窗口（输入链路断流自愈）',
+      mainSrc.indexOf('window.__zcwProbe') !== -1 &&
+        mainSrc.indexOf("log('page-probe-stuck'") !== -1 &&
+        mainSrc.indexOf("recreateWindow('page-interactive-stuck')") !== -1 &&
+        mainSrc.indexOf('if (!overlayShown)') !== -1,
+      JSON.stringify({
+        probe: mainSrc.indexOf('window.__zcwProbe') !== -1,
+        stuckLog: mainSrc.indexOf("log('page-probe-stuck'") !== -1,
+        recreate: mainSrc.indexOf("recreateWindow('page-interactive-stuck')") !== -1,
+        shownGate: mainSrc.indexOf('if (!overlayShown)') !== -1,
+      })
+    )
+    check(
+      'issue#13：浮层页面暴露 __zcwProbe 功能探针（命中测试 + 接管状态）',
+      (() => {
+        const widgetSrc = fs.readFileSync(path.join(PLUGIN_ROOT, 'lib', 'widget.js'), 'utf8')
+        return {
+          expose: /window\.__zcwProbe = function \(x, y\)/.test(widgetSrc),
+          hit: widgetSrc.indexOf('hit: isWhaleHit({ clientX: x, clientY: y }) || inChrome(node)') !== -1,
+        }
+      })(),
       ''
     )
     // 两线各有一个「按宿主窗口算浮层边界」的函数，名字不同（ZCode 线是
