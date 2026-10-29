@@ -17,6 +17,7 @@ const os = require('node:os')
 const { evaluateBootState, readNewestLogTail } = require('./ui-ready.cjs')
 const { isUpdaterRunning, yieldPlan } = require('./update-guard.cjs')
 const { overlayWorkAreaBounds } = require('./window-bounds.cjs')
+const { shouldHideBeforeSwitch } = require('./display-follow.cjs')
 
 const PORT = Number(process.env.WHALE_PORT) || 39321
 const TARGET_URL = 'http://127.0.0.1:' + PORT + '/'
@@ -241,11 +242,11 @@ async function probePage() {
 }
 
 function createWindow() {
-  // 先在主显示器工作区里把窗口建出来（跟随脚本只改页面视口，窗口矩形基本不变），
+  // 先在目标显示器工作区里把窗口建出来（跨屏跟随时换成 ZCode 所在屏，缺省主显示器），
   // 但不显示——等拿到 ZCode 窗口位置后再 show，避免鲸鱼先在别处闪一下。
   // 工作区四周留 4 DIP：任务栏自动隐藏时 workArea 等于整屏，精确铺满会被
   // Windows 当成全屏窗口，压制任务栏滑出热区（issue #8）。
-  const { workArea } = screen.getPrimaryDisplay()
+  const workArea = overlayWorkArea || screen.getPrimaryDisplay().workArea
   const bounds = overlayWorkAreaBounds(workArea)
   log('window-bounds', JSON.stringify(bounds))
   win = new BrowserWindow({
@@ -471,6 +472,9 @@ function startFollower() {
     try {
       if (!win || win.isDestroyed()) return
       const { workArea } = screen.getPrimaryDisplay()
+      // 兜底窗口在主屏，建窗依据也要一起复位，否则之后任何一次重建
+      // 都会把它送到上次换屏的副屏，而那边没有跟随脚本
+      overlayWorkArea = null
       win.setBounds(overlayWorkAreaBounds(workArea))
       if (!win.isVisible()) {
         win.showInactive()
@@ -528,6 +532,16 @@ function followerCommand(cmd) {
 // 透明窗口一旦 setBounds 改变尺寸/位置，合成层不会跟着重排，页面内容会被
 // 画到偏离窗口的地方（实测页面 (0,0) 的方块跑到窗口外的屏幕左上角）。
 let lastViewport = null
+
+// ---------- 跨显示器跟随 ----------
+// 浮层窗口固定覆盖一块显示器的工作区；透明窗口 setBounds 会错位（见上方注释），
+// 所以换屏只能整窗重建。判定看 ZCode 窗口中心落在哪块显示器，且稳定一小段时间，
+// 避免拖拽经过边界时来回重建。
+const DISPLAY_SWITCH_MS = 700
+// 等待换屏期间「当前屏还剩多少、要不要先隐身」的判据抽在 desktop/display-follow.cjs
+// （纯函数；selftest 用合成矩形覆盖负坐标副屏、不等宽屏与窄缝，不依赖双屏硬件）。
+let overlayWorkArea = null // 本次建窗使用的工作区（DIP）；null = 主显示器
+let pendingDisplay = null // { id, workArea, timer }
 
 // ---------- ZCode 启动就绪门控 ----------
 // ZCode 启动时主窗口先显示加载动画、约 6 秒后主界面才就绪（实测 3.14.4：
@@ -748,6 +762,7 @@ function ensureUiReadyPoll() {
 function applyZCodeBounds(msg) {
   if (!win || win.isDestroyed()) return
   if (msg.gone) {
+    clearPendingDisplay()
     log('zcode-gone')
     const plan = yieldPlan({ hostGone: true, updaterRunning: isUpdaterRunning() })
     yieldToHost(plan === 'quit-updater' ? 'updater' : 'hostgone')
@@ -760,6 +775,8 @@ function applyZCodeBounds(msg) {
   // 的位置/大小解耦：失焦、被盖住、最小化、启动加载中都不影响桌宠显示，唯一
   // 关心的是 ZCode 进程存活（msg.gone → 一起退出）。
   if (petMode) {
+    // 桌宠模式不参与换屏：别留一个到点还会重建窗口的计时器
+    clearPendingDisplay()
     // 全屏应用前台（borderless 游戏/视频/演示，follower 按「矩形覆盖整屏且非
     // 最大化且非 cloaked」判定）：桌宠让路，透明度隐身；退出全屏时 follower 的
     // 状态变化消息走回本函数，applyFrame 自带重现过渡。
@@ -774,11 +791,13 @@ function applyZCodeBounds(msg) {
   // show=false：ZCode 最小化、被别的应用盖住，或窗口暂时找不到。
   // 透明度隐身（而非 win.hide()），原因见 overlayShown 处的注释。
   if (msg.hide || msg.show === false) {
+    clearPendingDisplay()
     hideOverlay(msg.hide ? 'window-missing' : 'zcode-not-foreground')
     return
   }
   // ZCode 还在启动加载中：先隐身等着，就绪后由轮询补显示
   if (!uiReady && !refreshUiReady()) {
+    clearPendingDisplay()
     hideOverlay('zcode-loading')
     ensureUiReadyPoll()
     return
@@ -788,7 +807,8 @@ function applyZCodeBounds(msg) {
   // 哨兵矩形兜底：最小化窗口的矩形是假的（Windows 报 -32000 一类坐标 + 159x27
   // 的假尺寸），拿它定位会把视口甩出窗口——鲸鱼被画到不可见处。
   if (rect.x < -10000 || rect.y < -10000) {
-    if (petMode) return
+    // 桌宠模式在上面已提前 return，这里只剩跟随模式：哨兵矩形一律按窗口丢失隐身
+    clearPendingDisplay()
     hideOverlay('window-missing')
     return
   }
@@ -799,6 +819,10 @@ function applyZCodeBounds(msg) {
       if (dip && dip.width > 0 && dip.height > 0) rect = dip
     }
   } catch (err) {}
+
+  // 跨屏：ZCode 已稳定落在另一块显示器时，整窗重建到那块屏的工作区。
+  // 当前屏上已经看不到 ZCode 就先隐身等切换；还能看到大部分时照常跟随可见部分。
+  if (maybeSwitchDisplay(rect)) return
 
   // 视口 = ZCode 矩形 ∩ 浮层窗口（窗口相对坐标）。ZCode 最大化时会向四周各越界
   // 7px（边框过扫），窗口本身只覆盖工作区（减去安全边距）——不裁交集的话，页面可以把鲸鱼摆进
@@ -820,6 +844,72 @@ function applyZCodeBounds(msg) {
     return
   }
   applyFrame(frame)
+}
+
+// 目标显示器与当前浮层所在屏不同时，等位置静止 DISPLAY_SWITCH_MS 再整窗重建。
+// 返回 true 表示「这次先别按旧窗口算视口」：ZCode 已明显离开当前屏，浮层已隐身；
+// 还能看到大部分时返回 false，照常跟随可见部分。
+function maybeSwitchDisplay(rectDip) {
+  if (!win || win.isDestroyed()) return false
+  let current = null
+  let target = null
+  let winBounds = null
+  try {
+    winBounds = win.getBounds()
+    current = screen.getDisplayMatching(winBounds)
+    // 目标屏按 ZCode 窗口中心判定：getDisplayMatching 取的是「交集面积最大」，
+    // 窗口比目标屏宽时，中心已经过屏、多数面积却仍在原屏，会被误判成不用换屏。
+    const center = {
+      x: Math.round(rectDip.x + rectDip.width / 2),
+      y: Math.round(rectDip.y + rectDip.height / 2),
+    }
+    target = screen.getDisplayNearestPoint
+      ? screen.getDisplayNearestPoint(center)
+      : screen.getDisplayMatching(rectDip)
+  } catch (err) {
+    return false
+  }
+  if (!target || !current || target.id === current.id) {
+    clearPendingDisplay()
+    return false
+  }
+  // 当前屏还剩多少 ZCode、要不要先隐身：判据见 desktop/display-follow.cjs
+  const wasShown = overlayShown
+  const skipFrame = shouldHideBeforeSwitch(rectDip, winBounds)
+  if (skipFrame && wasShown) hideOverlay('display-switch-pending')
+
+  // 已经上屏的窗口要等位置静止再切，避免拖拽经过边界时来回重建；还没上屏
+  // （冷启动就在副屏、或刚被隐藏）时没有可见画面可闪，直接切，别让首个窗口
+  // 白等 700ms、把注定作废的页面加载跑完再丢掉。
+  const switchDelay = wasShown ? DISPLAY_SWITCH_MS : 0
+  const rectKey = rectDip.x + ',' + rectDip.y + ',' + rectDip.width + ',' + rectDip.height
+  if (pendingDisplay && pendingDisplay.id === target.id && pendingDisplay.rectKey === rectKey) return skipFrame
+  clearPendingDisplay()
+  const wanted = { id: target.id, workArea: target.workArea, rectKey, timer: null }
+  wanted.timer = setTimeout(() => {
+    if (!pendingDisplay || pendingDisplay.id !== wanted.id) return
+    pendingDisplay = null
+    if (!win || win.isDestroyed()) return
+    // 到点再确认一次：等待期间 ZCode 可能已经移回或移到第三块屏
+    let now = null
+    try {
+      now = screen.getDisplayMatching(win.getBounds())
+    } catch (err) {
+      return
+    }
+    if (!now || now.id === wanted.id) return
+    log('display-switch', String(wanted.id) + ' ' + JSON.stringify(wanted.workArea))
+    overlayWorkArea = wanted.workArea
+    recreateWindow('display-switch ' + wanted.id)
+  }, switchDelay)
+  pendingDisplay = wanted
+  return skipFrame
+}
+
+function clearPendingDisplay() {
+  if (!pendingDisplay) return
+  if (pendingDisplay.timer) clearTimeout(pendingDisplay.timer)
+  pendingDisplay = null
 }
 
 // 计算视口并推送（含显示/重现过渡）。frame 是窗口相对坐标；pet:1 标记桌宠
@@ -904,6 +994,29 @@ ipcMain.handle('whale:follow-interval-get', () => followIntervalMs)
 ipcMain.on('whale:pet-mode', (_event, value) => setPetMode(value))
 ipcMain.on('whale:quit', () => app.quit())
 ipcMain.handle('whale:workarea', () => screen.getPrimaryDisplay().workArea)
+
+// 迁移说明页外开（lib/widget.js 的「查看说明后升级」）。白名单与 lib/migrate.mjs
+// 的 validateMigrationUrl 同口径（main 进程是 CJS，引不了 ESM，这里按同一份清单
+// 硬编码；改白名单两处必须同步）：https + 本仓库 GitHub Releases 域 + 路径前缀。
+// 页面拿到的 URL 虽然来自服务端校验过的 offer，这里仍按纵深防御再校验一遍——
+// 主进程 openExternal 一旦放开就是任意协议/任意域，不能只靠渲染层把关。
+ipcMain.handle('whale:open-external', async (_event, url) => {
+  try {
+    const u = new URL(String(url || ''))
+    if (u.protocol !== 'https:') return false
+    if (u.username || u.password) return false
+    const host = u.hostname.toLowerCase()
+    const okHost =
+      host === 'github.com' || host === 'objects.githubusercontent.com' || host === 'release-assets.githubusercontent.com'
+    if (!okHost) return false
+    if (u.port && u.port !== '443') return false
+    if (!u.pathname.startsWith('/pigeon189/zcode-fox-widget/releases/')) return false
+    await shell.openExternal(u.toString())
+    return true
+  } catch (err) {
+    return false
+  }
+})
 
 // 不可激活的窗口拿不到键盘输入。页面在指针按到菜单里的文本框/下拉时才请求
 // 临时恢复可激活并主动取一次焦点，浮层 UI 全部关闭时再交还前台（回到不可
@@ -1023,6 +1136,11 @@ function recreateWindow(reason) {
   uiReady = false
   zcodePid = 0
   zcodePidStart = 0
+  // 旧跟随消息属于旧窗口坐标：重建后先等新跟随进程的消息，否则会拿旧屏的
+  // 矩形再触发一次换屏，来回重建
+  clearPendingDisplay()
+  lastFollowerMsg = null
+  lastViewport = null
   createWindow()
   recreating = false
 }
@@ -1031,7 +1149,17 @@ app.whenReady().then(() => {
   createWindow()
   screen.on('display-metrics-changed', (_event, _display, metrics) => {
     // 稍等一拍再动手，让系统先把显示器拓扑稳定下来
-    setTimeout(() => recreateWindow('display-metrics-changed ' + JSON.stringify(metrics || [])), 500)
+    setTimeout(() => {
+      // 重建要留在浮层当前所在的显示器上（跨屏跟随过的用户不能被拽回主屏）；
+      // 窗口已经没了就回主显示器
+      try {
+        if (win && !win.isDestroyed()) overlayWorkArea = screen.getDisplayMatching(win.getBounds()).workArea
+        else overlayWorkArea = null
+      } catch (err) {
+        overlayWorkArea = null
+      }
+      recreateWindow('display-metrics-changed ' + JSON.stringify(metrics || []))
+    }, 500)
   })
 })
 app.on('window-all-closed', () => {

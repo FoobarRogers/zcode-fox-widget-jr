@@ -3440,6 +3440,134 @@ try {
   })
   check('更新路由：未知动作 400（不误触发任何流程）', badAction.status === 400, 'status=' + badAction.status)
 
+  // fox-dock 迁移入口路由：offer 由服务端探测落盘（migrationProbe），这里直接种
+  // 状态文件驱动各分支。GET 会触发节流探测，但 WHALE_DISABLE_UPDATE_CHECK=1 时
+  // maybeProbeMigration 直接短路，不会发真实网络请求。
+  const GOOD_MIGRATION_OFFER = {
+    product: 'fox-dock',
+    version: '2.0.0',
+    channel: 'stable',
+    notesUrl: 'https://github.com/pigeon189/zcode-fox-widget/releases/download/dock-v2.0.0/release-notes-2.0.0.html',
+    downloadUrl: 'https://github.com/pigeon189/zcode-fox-widget/releases/tag/dock-v2.0.0',
+    summary: 'fox-dock 2.0 正式版：独立桌宠 + 权限接管 + 旧数据导入',
+    highlights: ['独立程序，不再依赖宿主插件运行'],
+    costs: ['自定义气泡图片/模板不自动迁移'],
+  }
+  const migGet0 = await getJson(port, '/whale/update.json')
+  check(
+    '迁移路由：无 migrationProbe 时 migration.available=false（默认无入口）',
+    migGet0 && migGet0.migration && migGet0.migration.available === false,
+    JSON.stringify(migGet0 && migGet0.migration)
+  )
+  fs.writeFileSync(
+    path.join(dataDir, 'update-state.json'),
+    JSON.stringify({ latest: null, available: false, busy: false, phase: null, checkedAt: Date.now(), source: 'test', migrationProbe: { at: Date.now(), manifestVersion: pluginJson.version, eol: false, offer: GOOD_MIGRATION_OFFER } }),
+    'utf8'
+  )
+  const migGet1 = await getJson(port, '/whale/update.json')
+  check(
+    '迁移路由：合法 stable offer 且清单版本=当前版本 → available=true 且带 costs',
+    migGet1 && migGet1.migration && migGet1.migration.available === true && migGet1.migration.version === '2.0.0' &&
+      Array.isArray(migGet1.migration.costs) && migGet1.migration.costs.length === 1 && !!migGet1.migration.notesUrl,
+    JSON.stringify(migGet1 && migGet1.migration)
+  )
+  fs.writeFileSync(
+    path.join(dataDir, 'update-state.json'),
+    JSON.stringify({ latest: null, available: false, busy: false, phase: null, migrationProbe: { at: Date.now(), manifestVersion: '0.0.9', eol: false, offer: GOOD_MIGRATION_OFFER } }),
+    'utf8'
+  )
+  const migGet2 = await getJson(port, '/whale/update.json')
+  check(
+    '迁移路由：清单版本比当前旧（镜像滞后）→ 不回放旧 offer',
+    migGet2 && migGet2.migration && migGet2.migration.available === false && migGet2.migration.manifestVersion === '0.0.9'
+  )
+  // 恢复合法 offer，测跳过与预检
+  fs.writeFileSync(
+    path.join(dataDir, 'update-state.json'),
+    JSON.stringify({ latest: null, available: false, busy: false, phase: null, migrationProbe: { at: Date.now(), manifestVersion: pluginJson.version, eol: false, offer: GOOD_MIGRATION_OFFER } }),
+    'utf8'
+  )
+  const migSkipRes = await fetch('http://127.0.0.1:' + port + '/whale/update.json', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'migrate-skip' }),
+  })
+  const migSkipBody = await migSkipRes.json()
+  const migSkipState = JSON.parse(fs.readFileSync(path.join(dataDir, 'widget-state.json'), 'utf8'))
+  check(
+    '迁移路由：migrate-skip → 写 widget-state.migrationSkip（与 updateSkip 独立）且入口隐藏',
+    migSkipRes.ok && migSkipBody.migration.available === false && migSkipState.migrationSkip === '2.0.0' && migSkipState.updateSkip === null,
+    JSON.stringify({ migrationSkip: migSkipState.migrationSkip, updateSkip: migSkipState.updateSkip })
+  )
+  const migUnskipRes = await fetch('http://127.0.0.1:' + port + '/whale/update.json', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'migrate-unskip' }),
+  })
+  const migUnskipBody = await migUnskipRes.json()
+  const migUnskipState = JSON.parse(fs.readFileSync(path.join(dataDir, 'widget-state.json'), 'utf8'))
+  check(
+    '迁移路由：migrate-unskip → migrationSkip 清空、入口恢复',
+    migUnskipRes.ok && migUnskipBody.migration.available === true && migUnskipState.migrationSkip === null
+  )
+  // eol 逃生门（安全审查 P2-1）：migrate-unskip 顺带解除 eol 锁定，不留「只能手删
+  // 状态文件」的死角
+  fs.writeFileSync(
+    path.join(dataDir, 'update-state.json'),
+    JSON.stringify({ latest: null, available: false, busy: false, phase: null, migrationProbe: { at: Date.now(), manifestVersion: pluginJson.version, eol: true, offer: GOOD_MIGRATION_OFFER } }),
+    'utf8'
+  )
+  const migEolRes = await fetch('http://127.0.0.1:' + port + '/whale/update.json', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'migrate-unskip' }),
+  })
+  const migEolProbe = JSON.parse(fs.readFileSync(path.join(dataDir, 'update-state.json'), 'utf8')).migrationProbe
+  check(
+    '迁移路由：migrate-unskip 解除 eol 锁定（逃生门）',
+    migEolRes.ok && migEolProbe.eol === false && !!migEolProbe.offer,
+    JSON.stringify({ eol: migEolProbe.eol })
+  )
+  // 409 分支：先把 offer 摘掉（远端撤掉 migration 块后的下一次探测就是这个形状）
+  fs.writeFileSync(
+    path.join(dataDir, 'update-state.json'),
+    JSON.stringify({ latest: null, available: false, busy: false, phase: null, migrationProbe: { at: Date.now(), manifestVersion: pluginJson.version, eol: false, offer: null, reason: '缺 migration 块' } }),
+    'utf8'
+  )
+  const migNoOffer = await fetch('http://127.0.0.1:' + port + '/whale/update.json', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'migrate' }),
+  })
+  check('迁移路由：无有效 offer 时 migrate 409（不进入预检）', migNoOffer.status === 409, 'status=' + migNoOffer.status)
+  // 恢复合法 offer 后预检：本机可能真装着 fox-dock（含 pre 版本），断言只盯结构
+  // 而不盯「dock 未装」——预检必须给出一组可照做的步骤，且不写任何 1.x 状态
+  fs.writeFileSync(
+    path.join(dataDir, 'update-state.json'),
+    JSON.stringify({ latest: null, available: false, busy: false, phase: null, migrationProbe: { at: Date.now(), manifestVersion: pluginJson.version, eol: false, offer: GOOD_MIGRATION_OFFER } }),
+    'utf8'
+  )
+  const migRes = await fetch('http://127.0.0.1:' + port + '/whale/update.json', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'migrate' }),
+  })
+  const migBody = await migRes.json()
+  check(
+    '迁移路由：migrate → 只做只读预检（返回 preflight + guide 步骤）',
+    migRes.ok && migBody.ok === true && migBody.preflight && migBody.preflight.checks && migBody.guide &&
+      Array.isArray(migBody.guide.steps) && migBody.guide.steps.length > 0 && typeof migBody.guide.dockReady === 'boolean',
+    JSON.stringify(migBody.guide)
+  )
+  check(
+    '迁移路由：preflight 只报 config 键名与数量（不泄值）；结构完整',
+    typeof migBody.preflight.ok === 'boolean' && Array.isArray(migBody.preflight.config.keys) &&
+      typeof migBody.preflight.dock.online === 'boolean' && typeof migBody.preflight.data.bytes === 'number',
+    JSON.stringify(migBody.preflight.checks)
+  )
+  // 注意：watch-uninstall 动作不在这里 POST——测试进程的 APPDATA 是真实启动文件夹，
+  // 该动作会撤掉真机的看门启动项；行为由 selftest-migrate 的源码钉覆盖。
+
   // 版本更新内核单测：独立子进程（隔离 ZCODE_HOME，避免写到真实数据目录）
   {
     const run = spawnSync(process.execPath, [path.join(PLUGIN_ROOT, 'tools', 'selftest-update.mjs')], {
@@ -3450,6 +3578,20 @@ try {
     check(
       '版本更新内核单测全绿（版本比较 / 出站守卫 / tar 解包 / 落盘清理 / 检查回退 / 整包更新 / 防重入）',
       run.status === 0 && !!m && m[1] === m[2] && Number(m[2]) >= 28,
+      m ? m[0] + '（共 ' + m[2] + ' 项）' : (((run.stderr || '') + (run.stdout || '')).slice(-260) || '无输出')
+    )
+  }
+
+  // 迁移引导单测：独立子进程（同上；kill switch 只在用例内显式传 env）
+  {
+    const run = spawnSync(process.execPath, [path.join(PLUGIN_ROOT, 'tools', 'selftest-migrate.mjs')], {
+      encoding: 'utf8',
+      env: { ...process.env, ZCODE_HOME: tmpHome, WHALE_DISABLE_UPDATE_CHECK: '1' },
+    })
+    const m = /迁移引导自检：(\d+)\/(\d+) 通过/.exec(String(run.stdout || ''))
+    check(
+      '迁移引导单测全绿（offer 校验 / stable-only / URL 白名单 / 多镜像取舍 / 探测节流 / 预检只读 / eol 哨兵 / 普通更新回归）',
+      run.status === 0 && !!m && m[1] === m[2] && Number(m[2]) >= 50,
       m ? m[0] + '（共 ' + m[2] + ' 项）' : (((run.stderr || '') + (run.stdout || '')).slice(-260) || '无输出')
     )
   }
@@ -3974,6 +4116,116 @@ try {
         /const bounds = overlayWorkAreaBounds\(workArea\)/.test(mainSrc) &&
         /win\.setBounds\(overlayWorkAreaBounds\(wa\)\)/.test(mainSrc) &&
         /win\.setBounds\(overlayWorkAreaBounds\(workArea\)\)/.test(mainSrc),
+      ''
+    )
+  }
+
+  // PR #15：跨显示器跟随。换屏算术与阈值抽在 desktop/display-follow.cjs（双屏硬件
+  // 上不了 CI，这里用合成矩形覆盖负坐标副屏、不等宽屏、窄缝与退化矩形），主进程侧
+  // 锁住判定顺序、重建前清理、早退分支清理与「没上屏就别等防抖」。
+  {
+    const { MIN_PENDING_VISIBLE, MIN_PENDING_OVERLAP_RATIO, overlapOf, shouldHideBeforeSwitch } = requireCjs(
+      path.join(PLUGIN_ROOT, 'desktop', 'display-follow.cjs')
+    )
+    const win = { x: 0, y: 0, width: 2560, height: 1440 }
+    const rect = (x, y, width, height) => ({ x, y, width, height })
+    check(
+      'PR#15：副屏在主屏左侧（负坐标）完全移出 → 先隐身',
+      shouldHideBeforeSwitch(rect(-2560, 0, 2560, 1440), win) === true &&
+        overlapOf(rect(-2560, 0, 2560, 1440), win).ratio === 0
+    )
+    check(
+      'PR#15：还剩 45% 时不隐身，32% 时隐身',
+      shouldHideBeforeSwitch(rect(-1408, 0, 2560, 1440), win) === false &&
+        shouldHideBeforeSwitch(rect(-1741, 0, 2560, 1440), win) === true
+    )
+    check(
+      'PR#15：只剩 4px 窄缝时隐身（不把鲸鱼钳在缝里）',
+      shouldHideBeforeSwitch(rect(-2556, 0, 2560, 1440), win) === true
+    )
+    check(
+      'PR#15：上下堆叠时按高度判窄缝',
+      shouldHideBeforeSwitch(rect(0, -1340, 2560, 1440), win) === true
+    )
+    check(
+      'PR#15：退化/零面积矩形不产生 NaN',
+      shouldHideBeforeSwitch(rect(0, 0, 0, 0), win) === true &&
+        Number.isFinite(overlapOf(rect(0, 0, 0, 0), win).ratio)
+    )
+    check(
+      'PR#15：等待期阈值保持 120 DIP / 35%',
+      MIN_PENDING_VISIBLE === 120 && MIN_PENDING_OVERLAP_RATIO === 0.35
+    )
+    const mainSrc = fs.readFileSync(path.join(PLUGIN_ROOT, 'desktop', 'main.cjs'), 'utf8')
+    check(
+      'PR#15：换屏判定在视口计算之前，阈值不再写死在主进程',
+      mainSrc.indexOf('if (maybeSwitchDisplay(rect)) return') !== -1 &&
+        mainSrc.indexOf('if (maybeSwitchDisplay(rect)) return') <
+          mainSrc.indexOf('const vx0 = Math.round(rect.x - winBounds.x)') &&
+        mainSrc.indexOf('MIN_PENDING_OVERLAP_RATIO') === -1,
+      ''
+    )
+    check(
+      'PR#15：没上屏时不等 700ms 防抖，直接换屏',
+      /const wasShown = overlayShown/.test(mainSrc) &&
+        /const switchDelay = wasShown \? DISPLAY_SWITCH_MS : 0/.test(mainSrc) &&
+        /setTimeout\(\(\) => \{[\s\S]*?\}, switchDelay\)/.test(mainSrc),
+      ''
+    )
+    check(
+      'PR#15：目标屏按 ZCode 窗口中心判定',
+      /getDisplayNearestPoint\(center\)/.test(mainSrc) &&
+        /Math\.round\(rectDip\.x \+ rectDip\.width \/ 2\)/.test(mainSrc),
+      ''
+    )
+    check(
+      'PR#15：早退分支清掉待切换计时器',
+      /if \(msg\.gone\) \{\s*clearPendingDisplay\(\)/.test(mainSrc) &&
+        /if \(msg\.hide \|\| msg\.show === false\) \{\s*clearPendingDisplay\(\)/.test(mainSrc) &&
+        /if \(!uiReady && !refreshUiReady\(\)\) \{\s*clearPendingDisplay\(\)/.test(mainSrc),
+      ''
+    )
+    check(
+      'PR#15：重建时清旧跟随消息与视口，指标变化保留当前屏',
+      mainSrc.indexOf('clearPendingDisplay()\n  lastFollowerMsg = null') !== -1 &&
+        /screen\.getDisplayMatching\(win\.getBounds\(\)\)\.workArea/.test(mainSrc),
+      ''
+    )
+    check(
+      'PR#15：跟随脚本起不来时兜底回主屏并复位 overlayWorkArea',
+      /const \{ workArea \} = screen\.getPrimaryDisplay\(\)[\s\S]{0,300}?overlayWorkArea = null[\s\S]{0,120}?win\.setBounds\(overlayWorkAreaBounds\(workArea\)\)/.test(
+        mainSrc
+      ),
+      ''
+    )
+  }
+
+  // 二级面板与气泡：hidePanelsForBubble() 会把六个面板设成 visibility:hidden；
+  // 用户主动打开任一面板时必须先让气泡让路，否则面板要等气泡自动关闭才可见。
+  // 六个入口统一走 dismissBubbleForPanel()，只修单个面板会让其余入口继续复现。
+  {
+    const widgetSrc = fs.readFileSync(path.join(PLUGIN_ROOT, 'lib', 'widget.js'), 'utf8')
+    const panelToggles = ['toggleBookPanel', 'toggleMorePanel', 'toggleAboutPanel', 'toggleUpdatePanel']
+    const missing = panelToggles.filter(function (name) {
+      const start = widgetSrc.indexOf('function ' + name + '(')
+      if (start === -1) return true
+      return !/dismissBubbleForPanel\(\)/.test(widgetSrc.slice(start, start + 600))
+    })
+    check(
+      '打开任一二面板都先收掉当前气泡（气泡会把面板 visibility:hidden）',
+      /function dismissBubbleForPanel\(\) \{\s*if \(costBubbleActive\) hideCostBubble\(\)\s*else if \(bubbleShown\) hideBubble\(\)/.test(
+        widgetSrc
+      ) &&
+        missing.length === 0 &&
+        /if \(usageOpen\) \{\s*dismissBubbleForPanel\(\)/.test(widgetSrc) &&
+        /function toggleBubbleEditor\(\) \{[\s\S]{0,300}?dismissBubbleForPanel\(\)/.test(widgetSrc),
+      missing.join(',')
+    )
+    check(
+      '预警气泡被主动收起时一并清 alertBubbleTimer',
+      /function hideCostBubble\(\) \{[\s\S]{0,800}?if \(alertBubbleTimer\) \{\s*clearTimeout\(alertBubbleTimer\)\s*alertBubbleTimer = null/.test(
+        widgetSrc
+      ),
       ''
     )
   }
